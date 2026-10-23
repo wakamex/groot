@@ -1,6 +1,6 @@
 <h1 align="center">🌳 Groot 1</h1>
 
-<p align="center"><b>Calibrated decisions over long context, in one forward pass.</b></p>
+<p align="center"><b>Decisions with full probability distributions over long context, in one forward pass.</b></p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-2ea44f"></a>
@@ -32,7 +32,7 @@ Highlights:
 
 - 📰 **Beats Jev on zero-shot Portuguese news**: Groot 1 scores 87.8% on 400 Folha de S.Paulo articles, against 85.8% for Jev. None of these articles, or any Folha text, was in training.
 - 🎯 **Beats Jev and Julia 1 on typed decisions**: Groot 1 scores 75.3% on the full 2,000-question test split, against 73.7% for Jev and 72.7% for Julia 1.
-- 📏 **Calibrated**: Groot 1 has a typed-decision Brier of 0.066, under half of Jev's 0.156. On Folha it is 0.192, against 0.215 for Jev.
+- 📏 Best probability scores on typed decisions and the topic, emotion and intent sets: Groot 1 has a typed-decision Brier of 0.066, under half of Jev's 0.156. On Folha the two are level, and on ASSIN2 Jev scores better. [Details](#calibration-with-intervals).
 - 📚 **Long context**: 96–100% needle accuracy from 1k to 64k tokens, through BM25 state retrieval and a tree-reduce memory.
 - 🔀 **Order-proof**: block-masked option attention makes answers exactly invariant to option order, with up to 255 options per call.
 - 🇧🇷 **Multilingual**: trained on public sources in English and Portuguese, plus Portuguese web news labelled by URL section.
@@ -84,6 +84,21 @@ Counts on the two headline sets:
 | ASSIN2 | 0.391 | 0.384 | **0.330** | 1.005 |
 | HateBR | 0.230 | 0.223 | **0.203** | 0.565 |
 | BoolQ | 0.393 | 0.388 | **0.148** | 0.738 |
+
+#### Calibration with intervals
+
+A rerun of Groot 1, Jev and Julia 1 on the same 5,990 requests, rescored from the saved probabilities, adds log loss, expected calibration error (ECE), the accuracy of each system's 80% most confident answers, and 95% intervals from 1,000 bootstrap resamples of states. Its Folha rows come from [`scripts/folha.py`](scripts/folha.py), which follows the protocol above with its own section descriptions, so they are not the 400 articles in the tables above. Groot minus Jev, on the rows both answered:
+
+| Benchmark | n | Brier | Log loss | Accuracy of the 80% most confident |
+| --- | ---: | ---: | ---: | ---: |
+| Typed decisions | 2,000 | −0.091 [−0.102, −0.080] | −0.704 [−0.762, −0.645] | +0.015 [−0.010, +0.040] |
+| Folha news (rebuilt) | 400 | −0.007 [−0.043, +0.026] | −0.134 [−0.306, +0.005] | +0.006 [−0.022, +0.031] |
+| ASSIN2 | 500 | +0.060 [+0.022, +0.096] | +0.004 [−0.105, +0.093] | −0.065 [−0.106, −0.033] |
+| HateBR | 90 | +0.028 [−0.069, +0.121] | +0.025 [−0.108, +0.168] | −0.042 [−0.125, +0.069] |
+
+Negative Brier and log loss and positive accuracy favour Groot. On AG News, Emotion, Banking77, CLINC150 and MASSIVE every interval favours Groot. On Folha all three intervals include zero, so the rebuilt test does not separate the two systems.
+
+Groot's top probability runs below its accuracy on typed-decision choice and score questions, by 0.139 and 0.134, because it reproduces the spread of the soft gold labels: its typed-decision KL divergence from the gold distribution is 0.119, against 0.823 for Jev. ECE on those questions is 0.139 and 0.134 for Groot, against 0.046 and 0.120 for Jev. A fixed confidence threshold therefore accepts fewer of Groot's answers than its accuracy would allow; how well its confidence ranks answers, which the selective accuracy measures, is not affected. [Full results, with reliability tables](metrics/calibration-20261023.json).
 
 **Long context.** Needle-in-a-haystack decisions. Each request hides one fact in a long state of distractor text and asks one question. There are 100 requests per length. Needle names and templates are disjoint from training.
 
@@ -154,7 +169,7 @@ Its answers collapsed onto a few section names. v1.0 had learned its classificat
 
 ## Where Groot is accurate — and where it can miss
 
-Groot is strongest when the answer is **a choice grounded in the supplied state**. It leads on typed-decision choice and score questions, on zero-shot Folha news, and on every topic, emotion and intent set we ran. Its probabilities are also the best calibrated on those sets. Its typed-decision Brier is under half of Jev's. It handles 151 options in one call, Portuguese as well as English, and states up to 64k tokens.
+Groot is strongest when the answer is **a choice grounded in the supplied state**. It leads on typed-decision choice and score questions, on zero-shot Folha news, and on every topic, emotion and intent set we ran. Its Brier and log loss are the best on typed decisions and the topic, emotion and intent sets; on Folha they are level with Jev's. Its typed-decision Brier is under half of Jev's. It handles 151 options in one call, Portuguese as well as English, and states up to 64k tokens.
 
 Read the classification rows with care. **Groot was trained on the train splits of every classification set in the table**, so those are in-domain supervised results. Jev and Julia 1 do not publish their training data, so the comparison is not zero-shot for Groot. Folha news is the zero-shot check.
 
@@ -317,7 +332,7 @@ python scripts/benchmark.py run --rows bench.jsonl --groot Groot-1 \
 python scripts/benchmark.py table --results results.json
 ```
 
-Each system is optional. Omit `--julia` or `--jev` to skip it. Besides accuracy and Brier, the results report log loss, the accuracy of the 50% and 80% most confident answers, and the area under the risk-coverage curve, with Groot also ranked by its `p_correct` head. `run` saves every system's per-row probabilities as `results.<system>.jsonl`, and `python scripts/benchmark.py rescore --rows bench.jsonl --out results.json` recomputes the summaries from them without calling any model. Long-context accuracy comes from `scripts/needle_eval.py` on needle sets made by `python -m groot1.longctx needles`.
+Each system is optional. Omit `--julia` or `--jev` to skip it. Besides accuracy and Brier, the results report log loss, KL divergence and total variation distance from the gold distribution, ECE with a reliability table, the ranked probability score on score questions, the accuracy of the 50% and 80% most confident answers, and the area under the risk-coverage curve, with Groot also ranked by its `p_correct` head. Every metric has a 95% bootstrap interval over states, and `paired` holds Groot minus each other system with intervals. `run` saves every system's per-row probabilities as `results.<system>.jsonl`, and `python scripts/benchmark.py rescore --rows bench.jsonl --out results.json` recomputes the summaries from them without calling any model. Long-context accuracy comes from `scripts/needle_eval.py` on needle sets made by `python -m groot1.longctx needles`.
 
 The v1.1 training data adds two builders:
 
@@ -346,7 +361,7 @@ The trainer batches by token budget, resumes from periodic checkpoints and rolls
 - Surface cues can outweigh meaning. "I was charged twice for the same order" routes to shipping, because the word "order" dominates. Groot 1 S gives it 0.97 probability and Groot 1 gives it 0.56. Keep option descriptions distinct and test your own phrasing.
 - States above 16k tokens are slower than Jev's API, and accuracy degrades with long distractor-heavy states.
 - Images, `box` questions and other System One extensions are not supported; such requests are rejected.
-- The probabilities are calibrated on validation data, but they are not guarantees. Evaluate on your own workflow before using Groot for consequential actions.
+- The probabilities are calibrated on validation data, but they are not guarantees. On typed-decision choice and score questions the top probability is about 0.13 below the accuracy, so set confidence thresholds from your own data. Evaluate on your own workflow before using Groot for consequential actions.
 
 The code and model artifacts are licensed under **Apache 2.0**. mmBERT is MIT-licensed. Each training dataset keeps its own license; see [NOTICE](NOTICE).
 

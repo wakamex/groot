@@ -4,7 +4,9 @@
 
 400 articles from emdemor/news-of-the-brazilian-newspaper (Folha de S.Paulo), 50 per section for
 8 sections, drawn with a fixed seed. Every section is offered with a one-line Portuguese
-description; the gold label is the section the newsroom filed the article under. The rows use
+description; the gold label is the section the newsroom filed the article under. This follows the
+README's Folha protocol, but the question, the section descriptions and the sampling are this
+script's own, so its rows are not the 400 articles behind the README's main tables. The rows use
 the benchmark row format, so they can be appended to the file `benchmark.py build` writes.
 """
 from __future__ import annotations

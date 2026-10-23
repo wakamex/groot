@@ -9,11 +9,20 @@
 Accuracy is argmax agreement with the gold distribution's argmax; Brier is the
 multiclass Brier score against the (possibly soft) gold distribution. Log loss is
 the cross-entropy against the gold distribution, with each probability floored at
-1e-6 so that a single zero cannot make the mean infinite. Selective accuracy at
-coverage c is the accuracy of the c most confident answers, ranked by top
-probability; AURC is the area under the risk-coverage curve (mean error rate of
+1e-6 so that a single zero cannot make the mean infinite; KL is the same quantity
+minus the gold distribution's entropy, and TV is the total variation distance from
+it. ECE compares the top probability with accuracy in 10 equal-width bins, and the
+bins are saved as a reliability table. RPS, for score questions only, is the ranked
+probability score over the ordered levels, divided by (levels - 1). Selective
+accuracy at coverage c is the accuracy of the c most confident answers, ranked by
+top probability; AURC is the area under the risk-coverage curve (mean error rate of
 the k most confident answers over every k; lower is better). For Groot the same
-ranking is also reported with its p_correct head. Latency is the median wall
+ranking is also reported with its p_correct head.
+
+Intervals are 95% percentile intervals from 1,000 bootstrap resamples of states
+(rows sharing a state_key are resampled together, since typed decisions asks
+several questions about each state). `paired` holds Groot minus each other
+system on the rows both answered, with the same resamples applied to both. Latency is the median wall
 time of one request (one question). Groot and Julia run in-process on the same
 GPU; Jev is called over its public HTTPS API, so its latency includes the
 network round trip.
@@ -34,6 +43,8 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import numpy as np
 
 
 def build(test: str, sources: list[str], per_source: int, out: str, seed: int = 0) -> None:
@@ -89,6 +100,10 @@ def probs_of(answer: dict, kind: str, keys: list[str]) -> list[float]:
 
 LOG_FLOOR = 1e-6
 COVERAGES = (0.5, 0.8)
+ECE_BINS = 10
+BOOTSTRAP = 1000
+INTERVAL = ("acc", "brier", "logloss", "kl", "tv", "ece", "rps", "acc@80%", "aurc")
+PAIRED = ("acc", "brier", "logloss", "kl", "ece", "acc@80%", "aurc")
 
 
 def argmax(v: list[float]) -> int:
@@ -97,21 +112,92 @@ def argmax(v: list[float]) -> int:
 
 def score(r: dict, p: list[float]) -> dict:
     t = r["target"]
-    return {"ok": argmax(p) == argmax(t), "brier": sum((a - b) ** 2 for a, b in zip(p, t)),
-            "logloss": -sum(b * math.log(max(a, LOG_FLOOR)) for a, b in zip(p, t) if b > 0)}
-
-
-def selective(oks: list[bool], conf: list[float]) -> dict:
-    """Accuracy of the most confident answers at fixed coverages, and the area under the risk-coverage curve."""
-    ranked = [ok for _, ok in sorted(zip(conf, oks), key=lambda x: -x[0])]
-    errors, risks = 0, []
-    for k, ok in enumerate(ranked, 1):
-        errors += not ok
-        risks.append(errors / k)
-    out = {f"acc@{c:.0%}": 1 - risks[max(1, round(c * len(ranked))) - 1] for c in COVERAGES}
-    out["aurc"] = sum(risks) / len(risks)
+    out = {"ok": argmax(p) == argmax(t), "conf": max(p), "brier": sum((a - b) ** 2 for a, b in zip(p, t)),
+           "logloss": -sum(b * math.log(max(a, LOG_FLOOR)) for a, b in zip(p, t) if b > 0),
+           "kl": sum(b * math.log(b / max(a, LOG_FLOOR)) for a, b in zip(p, t) if b > 0),
+           "tv": sum(abs(a - b) for a, b in zip(p, t)) / 2}
+    if r["type"] == "score" and len(p) > 1:
+        cp = ct = rps = 0.0
+        for a, b in zip(p[:-1], t[:-1]):
+            cp, ct = cp + a, ct + b
+            rps += (cp - ct) ** 2
+        out["rps"] = rps / (len(p) - 1)
     return out
 
+
+def selective(ok: np.ndarray, conf: np.ndarray) -> dict:
+    """Accuracy of the most confident answers at fixed coverages, and the area under the risk-coverage curve."""
+    ranked = ok[np.argsort(-conf, kind="stable")]
+    risks = np.cumsum(~ranked) / np.arange(1, len(ranked) + 1)
+    out = {f"acc@{c:.0%}": float(1 - risks[max(1, round(c * len(ranked))) - 1]) for c in COVERAGES}
+    out["aurc"] = float(risks.mean())
+    return out
+
+
+def bins_of(conf: np.ndarray) -> np.ndarray:
+    return np.minimum((conf * ECE_BINS).astype(int), ECE_BINS - 1)
+
+
+def ece(ok: np.ndarray, conf: np.ndarray) -> float:
+    b = bins_of(conf)
+    n = np.bincount(b, minlength=ECE_BINS)
+    gap = np.abs(np.bincount(b, ok, ECE_BINS) - np.bincount(b, conf, ECE_BINS))
+    return float(gap.sum() / max(1, n.sum()))
+
+
+def reliability(ok: np.ndarray, conf: np.ndarray) -> list[dict]:
+    b = bins_of(conf)
+    return [{"bin": [i / ECE_BINS, (i + 1) / ECE_BINS], "n": int((b == i).sum()),
+             "conf": float(conf[b == i].mean()), "acc": float(ok[b == i].mean())} for i in range(ECE_BINS) if (b == i).any()]
+
+
+def metrics(x: dict, idx: np.ndarray | None = None) -> dict:
+    """Every summary metric over the rows idx (all rows when None) of the per-row arrays x."""
+    if idx is not None:
+        x = {k: v[idx] for k, v in x.items()}
+    ok, conf = x["ok"], x["conf"]
+    out = {"acc": float(ok.mean()), "brier": float(x["brier"].mean()), "logloss": float(x["logloss"].mean()),
+           "kl": float(x["kl"].mean()), "tv": float(x["tv"].mean()), "ece": ece(ok, conf), **selective(ok, conf)}
+    rps = x["rps"][~np.isnan(x["rps"])]
+    if rps.size:
+        out["rps"] = float(rps.mean())
+    if "p_correct" in x:
+        out["p_correct"] = selective(ok, x["p_correct"])
+    return out
+
+
+def arrays(rows: list[dict], res: list[dict]) -> dict:
+    scored = [score(r, x["p"]) for r, x in zip(rows, res)]
+    x = {k: np.array([sc[k] for sc in scored], dtype=bool if k == "ok" else float) for k in ("ok", "conf", "brier", "logloss", "kl", "tv")}
+    x["rps"] = np.array([sc.get("rps", np.nan) for sc in scored])
+    if all("p_correct" in r for r in res):
+        x["p_correct"] = np.array([r["p_correct"] for r in res])
+    return x
+
+
+def resamples(rows: list[dict], seed: int = 0) -> list[np.ndarray]:
+    """Row indices of BOOTSTRAP resamples that draw whole states with replacement."""
+    groups = defaultdict(list)
+    for i, r in enumerate(rows):
+        groups[r.get("state_key", r.get("id", i))].append(i)
+    clusters = [np.array(v) for v in groups.values()]
+    rng = np.random.default_rng(seed)
+    return [np.concatenate([clusters[j] for j in rng.integers(0, len(clusters), len(clusters))]) for _ in range(BOOTSTRAP)]
+
+
+def interval(values: list[float]) -> list[float]:
+    return [float(np.percentile(values, 2.5)), float(np.percentile(values, 97.5))]
+
+
+def groups(rows: list[dict]) -> dict[str, list[int]]:
+    by = defaultdict(list)
+    for i, r in enumerate(rows):
+        by[r["source"]].append(i)
+        if r["source"] == "typed_decisions":
+            by["typed_decisions / " + r["type"]].append(i)
+        if r["source"].startswith("massive_"):  # scenario (18 labels) and intent (60 labels) questions
+            by[f"{r['source']} / {len(r['options'])} labels"].append(i)
+    return by
 
 def run_groot(rows, ckpt, overrides):
     from groot1.config import parse_overrides
@@ -193,29 +279,45 @@ def run_jev(rows, workers=8):
 
 
 def summarize(rows, res):
-    res = [x if "skip" in x else {**x, **score(r, x["p"])} for r, x in zip(rows, res)]
-    by = defaultdict(list)
-    for r, x in zip(rows, res):
-        by[r["source"]].append(x)
-        if r["source"] == "typed_decisions":
-            by["typed_decisions / " + r["type"]].append(x)
-        if r["source"].startswith("massive_"):  # scenario (18 labels) and intent (60 labels) questions
-            by[f"{r['source']} / {len(r['options'])} labels"].append(x)
     out = {}
-    for k, xs in by.items():
-        done = [x for x in xs if "skip" not in x]
+    for k, idx in groups(rows).items():
+        done = [i for i in idx if "skip" not in res[i]]
         if not done:
-            out[k] = {"n": 0, "skipped": len(xs), "reason": xs[0].get("skip")}
+            out[k] = {"n": 0, "skipped": len(idx), "reason": res[idx[0]].get("skip")}
             continue
-        oks = [x["ok"] for x in done]
-        out[k] = {"n": len(done), "correct": sum(oks), "acc": sum(oks) / len(done),
-                  "brier": sum(x["brier"] for x in done) / len(done),
-                  "logloss": sum(x["logloss"] for x in done) / len(done),
-                  **selective(oks, [max(x["p"]) for x in done]),
-                  "p50_ms": statistics.median(x["ms"] for x in done), "skipped": len(xs) - len(done)}
-        if all("p_correct" in x for x in done):
-            out[k]["p_correct"] = selective(oks, [x["p_correct"] for x in done])
+        sub_rows, sub_res = [rows[i] for i in done], [res[i] for i in done]
+        x = arrays(sub_rows, sub_res)
+        boot = [metrics(x, ix) for ix in resamples(sub_rows)]
+        m = metrics(x)
+        out[k] = {"n": len(done), "correct": int(x["ok"].sum()), **m,
+                  "ci": {name: interval([b[name] for b in boot]) for name in INTERVAL if name in m},
+                  "reliability": reliability(x["ok"], x["conf"]),
+                  "p50_ms": statistics.median(r["ms"] for r in sub_res), "skipped": len(idx) - len(done)}
     return out
+
+
+def paired(rows, a: list[dict], b: list[dict]) -> dict:
+    """a minus b on the rows both answered, per group, with intervals from the same state resamples."""
+    out = {}
+    for k, idx in groups(rows).items():
+        both = [i for i in idx if "skip" not in a[i] and "skip" not in b[i]]
+        if not both:
+            continue
+        sub_rows = [rows[i] for i in both]
+        xa, xb = arrays(sub_rows, [a[i] for i in both]), arrays(sub_rows, [b[i] for i in both])
+        ma, mb = metrics(xa), metrics(xb)
+        boot = [(metrics(xa, ix), metrics(xb, ix)) for ix in resamples(sub_rows)]
+        out[k] = {"n": len(both), **{name: {"diff": ma[name] - mb[name], "ci": interval([u[name] - v[name] for u, v in boot])} for name in PAIRED}}
+    return out
+
+
+def compare(rows, out: str, results: dict) -> None:
+    """results["paired"][other] = Groot minus other, from the saved per-row files."""
+    if not per_row_path(out, "groot").exists():
+        return
+    g = load_per_row(per_row_path(out, "groot"), rows)
+    results["paired"] = {name: paired(rows, g, load_per_row(per_row_path(out, name), rows))
+                         for name in ("julia", "jev") if per_row_path(out, name).exists()}
 
 
 def per_row_path(out: str, name: str) -> Path:
@@ -272,6 +374,40 @@ def calibration_table(results: dict) -> str:
     return "\n".join(lines)
 
 
+def detail_table(results: dict) -> str:
+    """ECE, KL and (score questions) RPS per system."""
+    systems = [s for s in ("groot", "julia", "jev") if s in results]
+    keys = sorted({k for s in systems for k in results[s]}, key=lambda k: (" / " in k, k))
+    lines = ["| Benchmark | n | " + " | ".join(f"{s.capitalize()} ECE | {s.capitalize()} KL | {s.capitalize()} RPS" for s in systems) + " |",
+             "|" + "---|" * (2 + 3 * len(systems))]
+    for k in keys:
+        n = max(results[s].get(k, {}).get("n", 0) for s in systems)
+        cells = []
+        for s in systems:
+            v = results[s].get(k, {})
+            cells += [f"{v[m]:.3f}" if m in v else "n/a" for m in ("ece", "kl", "rps")]
+        lines.append(f"| {k} | {n} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def paired_table(results: dict) -> str:
+    """Groot minus each other system, with 95% intervals, for Brier, log loss and accuracy at 80% coverage."""
+    lines = []
+    for other, by in results.get("paired", {}).items():
+        lines += [f"Groot minus {other.capitalize()} (negative Brier and log loss, positive acc@80%, favour Groot)", "",
+                  "| Benchmark | n | Brier | Log loss | acc@80% |", "|---|---|---|---|---|"]
+        for k in sorted(by, key=lambda k: (" / " in k, k)):
+            v = by[k]
+            cells = [f"{v[m]['diff']:+.3f} [{v[m]['ci'][0]:+.3f}, {v[m]['ci'][1]:+.3f}]" for m in ("brier", "logloss", "acc@80%")]
+            lines.append(f"| {k} | {v['n']} | " + " | ".join(cells) + " |")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def all_tables(results: dict) -> str:
+    return "\n\n".join(t for t in (table(results), calibration_table(results), detail_table(results), paired_table(results)) if t)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -297,8 +433,7 @@ def main() -> None:
         build(args.test, args.sources, args.per_source, args.out)
         return
     if args.cmd == "table":
-        results = json.loads(Path(args.results).read_text())
-        print(table(results) + "\n\n" + calibration_table(results))
+        print(all_tables(json.loads(Path(args.results).read_text())))
         return
     rows = [json.loads(l) for l in open(args.rows, encoding="utf-8")]
     results = json.loads(Path(args.out).read_text()) if Path(args.out).exists() else {}
@@ -306,8 +441,9 @@ def main() -> None:
         for name in ("groot", "julia", "jev"):
             if per_row_path(args.out, name).exists():
                 results[name] = summarize(rows, load_per_row(per_row_path(args.out, name), rows))
+        compare(rows, args.out, results)
         Path(args.out).write_text(json.dumps(results, indent=2))
-        print(table(results) + "\n\n" + calibration_table(results))
+        print(all_tables(results))
         return
     for name, fn in (("groot", lambda: run_groot(rows, args.groot, args.groot_set) if args.groot else None),
                      ("julia", lambda: run_julia(rows, args.julia) if args.julia else None),
@@ -319,7 +455,9 @@ def main() -> None:
         results[name] = summarize(rows, res)
         Path(args.out).write_text(json.dumps(results, indent=2))
         print(f"{name} done", flush=True)
-    print(table(results) + "\n\n" + calibration_table(results))
+    compare(rows, args.out, results)
+    Path(args.out).write_text(json.dumps(results, indent=2))
+    print(all_tables(results))
 
 
 if __name__ == "__main__":
