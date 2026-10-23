@@ -311,10 +311,11 @@ python scripts/benchmark.py build --test data/v1/test.jsonl --per-source 500 --o
     --sources typed_decisions agnews emotion banking77 clinc150 massive_en massive_pt assin2 hatebr boolq
 python scripts/benchmark.py run --rows bench.jsonl --groot Groot-1 \
     --julia path/to/Julia-1 --jev --out results.json   # Jev needs TYPESAFE_API_KEY
+python scripts/folha.py --out data/folha.jsonl && cat data/folha.jsonl >> bench.jsonl   # 400 Folha articles
 python scripts/benchmark.py table --results results.json
 ```
 
-Each system is optional. Omit `--julia` or `--jev` to skip it. Long-context accuracy comes from `scripts/needle_eval.py` on needle sets made by `python -m groot1.longctx needles`.
+Each system is optional. Omit `--julia` or `--jev` to skip it. Besides accuracy and Brier, the results report log loss, the accuracy of the 50% and 80% most confident answers, and the area under the risk-coverage curve, with Groot also ranked by its `p_correct` head. `run` saves every system's per-row probabilities as `results.<system>.jsonl`, and `python scripts/benchmark.py rescore --rows bench.jsonl --out results.json` recomputes the summaries from them without calling any model. Long-context accuracy comes from `scripts/needle_eval.py` on needle sets made by `python -m groot1.longctx needles`.
 
 The v1.1 training data adds two builders:
 

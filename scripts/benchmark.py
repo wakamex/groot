@@ -4,17 +4,29 @@
     python scripts/benchmark.py run --rows bench.jsonl --groot runs/x/final --groot-set state_retrieval=true \
         --julia models/Julia-1 --jev --out bench_results.json
     python scripts/benchmark.py table --results bench_results.json
+    python scripts/benchmark.py rescore --rows bench.jsonl --out bench_results.json
 
 Accuracy is argmax agreement with the gold distribution's argmax; Brier is the
-multiclass Brier score against the (possibly soft) gold distribution. Latency is
-the median wall time of one request (one question). Groot and Julia run
-in-process on the same GPU; Jev is called over its public HTTPS API, so its
-latency includes the network round trip.
+multiclass Brier score against the (possibly soft) gold distribution. Log loss is
+the cross-entropy against the gold distribution, with each probability floored at
+1e-6 so that a single zero cannot make the mean infinite. Selective accuracy at
+coverage c is the accuracy of the c most confident answers, ranked by top
+probability; AURC is the area under the risk-coverage curve (mean error rate of
+the k most confident answers over every k; lower is better). For Groot the same
+ranking is also reported with its p_correct head. Latency is the median wall
+time of one request (one question). Groot and Julia run in-process on the same
+GPU; Jev is called over its public HTTPS API, so its latency includes the
+network round trip.
+
+`run` writes each system's per-row probabilities next to the results
+(`bench_results.groot.jsonl`, ...), and `rescore` recomputes every summary from
+those files without calling any model.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import statistics
@@ -75,10 +87,30 @@ def probs_of(answer: dict, kind: str, keys: list[str]) -> list[float]:
     return [x / s for x in v]
 
 
-def score(r: dict, p: list[float]) -> tuple[bool, float]:
+LOG_FLOOR = 1e-6
+COVERAGES = (0.5, 0.8)
+
+
+def argmax(v: list[float]) -> int:
+    return max(range(len(v)), key=v.__getitem__)
+
+
+def score(r: dict, p: list[float]) -> dict:
     t = r["target"]
-    ok = max(range(len(p)), key=p.__getitem__) == max(range(len(t)), key=t.__getitem__)
-    return ok, sum((a - b) ** 2 for a, b in zip(p, t))
+    return {"ok": argmax(p) == argmax(t), "brier": sum((a - b) ** 2 for a, b in zip(p, t)),
+            "logloss": -sum(b * math.log(max(a, LOG_FLOOR)) for a, b in zip(p, t) if b > 0)}
+
+
+def selective(oks: list[bool], conf: list[float]) -> dict:
+    """Accuracy of the most confident answers at fixed coverages, and the area under the risk-coverage curve."""
+    ranked = [ok for _, ok in sorted(zip(conf, oks), key=lambda x: -x[0])]
+    errors, risks = 0, []
+    for k, ok in enumerate(ranked, 1):
+        errors += not ok
+        risks.append(errors / k)
+    out = {f"acc@{c:.0%}": 1 - risks[max(1, round(c * len(ranked))) - 1] for c in COVERAGES}
+    out["aurc"] = sum(risks) / len(risks)
+    return out
 
 
 def run_groot(rows, ckpt, overrides):
@@ -92,10 +124,10 @@ def run_groot(rows, ckpt, overrides):
         q, keys = to_question(r)
         req = SystemOneRequest(state=r["state"], questions={"q": q})
         t0 = time.perf_counter()
-        a = eng.answer(req.state, req.questions).answers["q"].model_dump()
+        resp = eng.answer(req.state, req.questions, extended=True)
         dt = (time.perf_counter() - t0) * 1000
-        ok, br = score(r, probs_of(a, r["type"], keys))
-        out.append({"ok": ok, "brier": br, "ms": dt})
+        out.append({"p": probs_of(resp.answers["q"].model_dump(), r["type"], keys),
+                    "p_correct": resp.x_groot["q"]["p_correct"], "ms": dt})
     return out
 
 
@@ -124,8 +156,7 @@ def run_julia(rows, path, device="cuda"):
             pr = res["answers"]["q"]["probabilities"]
             probs = [float(pr.get(k, 0.0)) for k in keys]
             s = sum(probs) or 1.0
-            ok, br = score(r, [x / s for x in probs])
-            out.append({"ok": ok, "brier": br, "ms": dt})
+            out.append({"p": [x / s for x in probs], "ms": dt})
         except Exception as e:
             out.append({"skip": f"error: {str(e)[:120]}"})
     return out
@@ -151,8 +182,7 @@ def run_jev(rows, workers=8):
                     continue
                 if resp.status_code != 200:
                     return {"skip": f"{resp.status_code} {resp.text[:100]}"}
-                ok, br = score(r, probs_of(resp.json()["answers"]["q"], r["type"], keys))
-                return {"ok": ok, "brier": br, "ms": dt}
+                return {"p": probs_of(resp.json()["answers"]["q"], r["type"], keys), "ms": dt}
             except Exception as e:
                 err = str(e)[:100]
                 time.sleep(2 ** attempt)
@@ -163,6 +193,7 @@ def run_jev(rows, workers=8):
 
 
 def summarize(rows, res):
+    res = [x if "skip" in x else {**x, **score(r, x["p"])} for r, x in zip(rows, res)]
     by = defaultdict(list)
     for r, x in zip(rows, res):
         by[r["source"]].append(x)
@@ -176,10 +207,33 @@ def summarize(rows, res):
         if not done:
             out[k] = {"n": 0, "skipped": len(xs), "reason": xs[0].get("skip")}
             continue
-        out[k] = {"n": len(done), "correct": sum(x["ok"] for x in done), "acc": sum(x["ok"] for x in done) / len(done),
-                  "brier": sum(x["brier"] for x in done) / len(done), "p50_ms": statistics.median(x["ms"] for x in done),
-                  "skipped": len(xs) - len(done)}
+        oks = [x["ok"] for x in done]
+        out[k] = {"n": len(done), "correct": sum(oks), "acc": sum(oks) / len(done),
+                  "brier": sum(x["brier"] for x in done) / len(done),
+                  "logloss": sum(x["logloss"] for x in done) / len(done),
+                  **selective(oks, [max(x["p"]) for x in done]),
+                  "p50_ms": statistics.median(x["ms"] for x in done), "skipped": len(xs) - len(done)}
+        if all("p_correct" in x for x in done):
+            out[k]["p_correct"] = selective(oks, [x["p_correct"] for x in done])
     return out
+
+
+def per_row_path(out: str, name: str) -> Path:
+    p = Path(out)
+    return p.with_name(f"{p.stem}.{name}.jsonl")
+
+
+def save_per_row(path: Path, rows, res) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for r, x in zip(rows, res):
+            f.write(json.dumps({"id": r.get("id"), **x}, ensure_ascii=False) + "\n")
+
+
+def load_per_row(path: Path, rows) -> list[dict]:
+    res = [json.loads(l) for l in open(path, encoding="utf-8")]
+    if [x["id"] for x in res] != [r.get("id") for r in rows]:
+        raise SystemExit(f"{path} does not match the rows file")
+    return [{k: v for k, v in x.items() if k != "id"} for x in res]
 
 
 def table(results: dict) -> str:
@@ -193,6 +247,27 @@ def table(results: dict) -> str:
         for s in systems:
             v = results[s].get(k)
             cells += [f"{v['acc']:.3f}", f"{v['brier']:.3f}"] if v and v.get("n") else ["n/a", "n/a"]
+        lines.append(f"| {k} | {n} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def calibration_table(results: dict) -> str:
+    """Log loss and selective accuracy at 80% coverage per system, plus Groot ranked by p_correct."""
+    systems = [s for s in ("groot", "julia", "jev") if s in results]
+    keys = sorted({k for s in systems for k in results[s]}, key=lambda k: (" / " in k, k))
+    head = [f"{s.capitalize()} log loss | {s.capitalize()} acc@80%" for s in systems]
+    if "groot" in systems:
+        head.append("Groot acc@80% (p_correct)")
+    lines = ["| Benchmark | n | " + " | ".join(head) + " |", "|" + "---|" * (2 + 2 * len(systems) + ("groot" in systems))]
+    for k in keys:
+        n = max(results[s].get(k, {}).get("n", 0) for s in systems)
+        cells = []
+        for s in systems:
+            v = results[s].get(k)
+            cells += [f"{v['logloss']:.3f}", f"{v['acc@80%']:.3f}"] if v and "logloss" in v else ["n/a", "n/a"]
+        if "groot" in systems:
+            pc = results["groot"].get(k, {}).get("p_correct")
+            cells.append(f"{pc['acc@80%']:.3f}" if pc else "n/a")
         lines.append(f"| {k} | {n} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -214,25 +289,37 @@ def main() -> None:
     r.add_argument("--out", required=True)
     t = sub.add_parser("table")
     t.add_argument("--results", required=True)
+    rs = sub.add_parser("rescore")
+    rs.add_argument("--rows", required=True)
+    rs.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.cmd == "build":
         build(args.test, args.sources, args.per_source, args.out)
         return
     if args.cmd == "table":
-        print(table(json.loads(Path(args.results).read_text())))
+        results = json.loads(Path(args.results).read_text())
+        print(table(results) + "\n\n" + calibration_table(results))
         return
     rows = [json.loads(l) for l in open(args.rows, encoding="utf-8")]
     results = json.loads(Path(args.out).read_text()) if Path(args.out).exists() else {}
+    if args.cmd == "rescore":
+        for name in ("groot", "julia", "jev"):
+            if per_row_path(args.out, name).exists():
+                results[name] = summarize(rows, load_per_row(per_row_path(args.out, name), rows))
+        Path(args.out).write_text(json.dumps(results, indent=2))
+        print(table(results) + "\n\n" + calibration_table(results))
+        return
     for name, fn in (("groot", lambda: run_groot(rows, args.groot, args.groot_set) if args.groot else None),
                      ("julia", lambda: run_julia(rows, args.julia) if args.julia else None),
                      ("jev", lambda: run_jev(rows) if args.jev else None)):
         res = fn()
         if res is None:
             continue
+        save_per_row(per_row_path(args.out, name), rows, res)
         results[name] = summarize(rows, res)
         Path(args.out).write_text(json.dumps(results, indent=2))
         print(f"{name} done", flush=True)
-    print(table(results))
+    print(table(results) + "\n\n" + calibration_table(results))
 
 
 if __name__ == "__main__":
