@@ -100,6 +100,18 @@ Negative Brier and log loss and positive accuracy favour Groot. On AG News, Emot
 
 Groot's top probability runs below its accuracy on typed-decision choice and score questions, by 0.139 and 0.134, because it reproduces the spread of the soft gold labels: its typed-decision KL divergence from the gold distribution is 0.119, against 0.823 for Jev. ECE on those questions is 0.139 and 0.134 for Groot, against 0.046 and 0.120 for Jev. A fixed confidence threshold therefore accepts fewer of Groot's answers than its accuracy would allow; how well its confidence ranks answers, which the selective accuracy measures, is not affected. [Full results, with reliability tables](metrics/calibration-20261023.json).
 
+The M member of Groot 1 runs without fitted temperatures: its `m/calibration.json` on Hugging Face (revision `cbf179c`) is `[1.0, 1.0, 1.0]`, the trainer's starting value, while the S member's is `[1.619, 1.165, 1.321]`. [`scripts/calibrate.py`](scripts/calibrate.py) refits a model's or an ensemble's per-type temperatures on calibration rows, choosing the ensemble's on its averaged probabilities. Refitting the choice and true/false temperatures on 2,289 held-out rows (300 validation rows each from Emotion, CLINC150, MASSIVE en and pt, ASSIN2 and BoolQ, all 89 from HateBR, and 400 Folha development articles from `scripts/folha.py --dev`) sets them to S `[1.304, 1.165, 1.156]` and M `[1.035, 1.0, 1.134]`. Score questions keep their temperatures, because the only public held-out score questions are 147 ASSIN2 rows, and a fit on them made typed-decision score questions worse. On the benchmark, Groot 1 refit minus Groot 1 as released:
+
+| Benchmark | Brier | Log loss | ECE |
+| --- | ---: | ---: | ---: |
+| Folha news (rebuilt) | −0.0048 [−0.0073, −0.0022] | −0.0231 [−0.0291, −0.0165] | −0.032 [−0.044, −0.010] |
+| AG News | −0.0032 [−0.0047, −0.0017] | −0.0129 [−0.0168, −0.0086] | −0.022 [−0.033, −0.005] |
+| CLINC150 | −0.0042 [−0.0072, −0.0010] | −0.0071 [−0.0168, +0.0043] | −0.022 [−0.039, +0.006] |
+| Banking77 | −0.0022 [−0.0047, +0.0003] | +0.0144 [+0.0019, +0.0285] | +0.012 [−0.006, +0.035] |
+| Typed decisions | +0.0007 [+0.0004, +0.0010] | +0.0009 [+0.0002, +0.0016] | −0.009 [−0.013, −0.006] |
+
+The refit improves the hard-label choice sets and trades a little typed-decision Brier for lower ECE; true/false questions and ASSIN2 are unchanged within the intervals. It does not change Groot's standing against Jev: on Folha, the Brier difference moves from −0.007 to −0.012, with an interval that still includes zero. The released weights are unchanged; the refit temperatures are the values above.
+
 **Long context.** Needle-in-a-haystack decisions. Each request hides one fact in a long state of distractor text and asks one question. There are 100 requests per length. Needle names and templates are disjoint from training.
 
 | State tokens | Groot 1 | Groot 1 S | Jev | Groot 1 p50 | Groot 1 S p50 | Jev p50 |
