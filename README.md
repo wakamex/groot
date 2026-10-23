@@ -37,7 +37,7 @@ Highlights:
 - 🔀 **Order-proof**: block-masked option attention makes answers exactly invariant to option order, with up to 255 options per call.
 - 🇧🇷 **Multilingual**: trained on public sources in English and Portuguese, plus Portuguese web news labelled by URL section.
 - 🔌 **Drop-in**: serves the System One API, so existing `jev-latest` clients can point at it.
-- ⚡ **Pure Bend engine**: the full forward pass of Groot 1 S in [Bend](https://bend-lang.com), matching PyTorch to within 1e-7.
+- ⚡ **Pure Bend engine**: the full forward pass of Groot 1 S in [Bend](https://bend-lang.com), matching PyTorch to within 1e-7 on the test fixture and 4e-5 at full size.
 
 > **v1.1, 2026-10-23.** Groot 1 S v1.0 scored 33.8% on the Folha news test. Its answers collapsed onto a few labels it had memorised. This release fixes that failure. [What failed and how it was fixed](#the-folha-correction).
 
@@ -224,7 +224,7 @@ v1.1 adds the zero-shot stages described in [the Folha correction](#the-folha-co
 
 ## Bend engine
 
-[`bend/`](bend/) holds the complete forward pass of Groot 1 S in [Bend](https://bend-lang.com): kernels, the block-masked encoder, the tree memory and the fusion layers. It parallelizes over chunks and questions with fork/join. It runs as JavaScript through the generated host, or as a native binary on CPU threads and GPU. On the test fixture both paths match PyTorch to within 1e-7.
+[`bend/`](bend/) holds the complete forward pass of Groot 1 S in [Bend](https://bend-lang.com): kernels, the block-masked encoder, the tree memory and the fusion layers. It parallelizes over chunks and questions with fork/join. It runs as JavaScript through the generated host, or as a native binary on CPU threads. It has no GPU (`!`) calls, so a CUDA build of it also runs on the CPU. On the test fixture both paths match PyTorch to within 1e-7.
 
 ```bash
 groot-export bend --model Groot-1-S --out groot-1-s.gbw   # flat f32 weights
@@ -233,7 +233,9 @@ node bend/groot/parity.mjs                                            # parity v
 bend bend/main.bend -o groot                                          # native binary
 ```
 
-The Python serializer still builds the token request blob. The PyTorch runtime remains the fast path, and the Bend engine has not been benchmarked at full model size. The M member and ensemble averaging are not yet parity-tested in Bend. An ONNX export is not yet available for this architecture.
+The native binary reads the model whose `bend/groot/layout.bend` it was built with: `./groot model.gbw req.bin --threads 16 --gpu off` prints the output vector, one value per line. The committed layout matches the test fixture. For the full model, `python scripts/bend_bench.py prepare --model Groot-1-S --out bench-bend` writes the weights, the matching `layout.bend` to copy over before building, fixed requests with states of 1,024, 8,192 and 32,768 tokens and 64 questions each, and PyTorch float32 references for them. `python scripts/bend_bench.py reference --model Groot-1-S --request bench-bend/req-1024.json --threads 16` runs one of those requests through PyTorch and prints the same vector.
+
+The Python serializer still builds the token request blob. On the three `bend_bench.py` requests, the native binary matches PyTorch float32 to within 4e-5 on every output and 6e-6 on the probabilities. With 16 CPU threads it takes about 3 to 5 minutes per request, so the PyTorch runtime remains the fast path. The M member and ensemble averaging are not yet parity-tested in Bend. An ONNX export is not yet available for this architecture.
 
 ## Start here
 
@@ -309,9 +311,9 @@ curl -s localhost:8000/v1/systemone -H 'content-type: application/json' \
 groot-data build --out data/v1                         # public sources, see groot1/data.py
 python scripts/benchmark.py build --test data/v1/test.jsonl --per-source 500 --out bench.jsonl \
     --sources typed_decisions agnews emotion banking77 clinc150 massive_en massive_pt assin2 hatebr boolq
+python scripts/folha.py --out data/folha.jsonl && cat data/folha.jsonl >> bench.jsonl   # 400 Folha articles
 python scripts/benchmark.py run --rows bench.jsonl --groot Groot-1 \
     --julia path/to/Julia-1 --jev --out results.json   # Jev needs TYPESAFE_API_KEY
-python scripts/folha.py --out data/folha.jsonl && cat data/folha.jsonl >> bench.jsonl   # 400 Folha articles
 python scripts/benchmark.py table --results results.json
 ```
 

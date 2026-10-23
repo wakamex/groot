@@ -47,3 +47,22 @@ def test_gbw_header_and_layout(tmp_path):
     lay = layout_from_gbw(FIXTURE / "model.gbw", tmp_path / "layout.bend")
     text = lay.read_text()
     assert "def tree_norm" in text and "def d()" in text
+    assert f"def data_offset() -> U32:\n  {meta['data_offset']}\n" in text
+    committed = Path(__file__).parent.parent / "bend" / "groot" / "layout.bend"
+    assert committed.read_text() == text  # the committed layout is the fixture's
+
+
+def test_reference_outputs_match_fixture():
+    import importlib.util
+
+    from groot1.model import GrootDecisionModel
+
+    spec = importlib.util.spec_from_file_location("fixture", Path(__file__).parent.parent / "scripts" / "make_parity_fixture.py")
+    fx = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fx)
+    chunks, questions = fx.build_request(np.random.default_rng(0), 1024)
+    from groot1.bendio import reference_outputs
+
+    model = GrootDecisionModel.from_pretrained(FIXTURE / "ckpt").eval()
+    out = reference_outputs(model, chunks, questions, fx.PAD)
+    assert np.abs(out - np.load(FIXTURE / "ref.npy")).max() < 1e-5

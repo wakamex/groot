@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import struct
 from pathlib import Path
 
@@ -52,7 +53,7 @@ def _indexed_def(name: str, offsets: list[int]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_layout(header: dict, path: str | Path) -> Path:
+def write_layout(header: dict, path: str | Path, data_offset_bytes: int) -> Path:
     tm = _tensor_map(header)
     cfg, enc = header["config"], header["encoder_config"]
     off = lambda n: tm[n]["offset"] // 4 if n in tm else IDENTITY  # noqa: E731
@@ -79,6 +80,8 @@ def write_layout(header: dict, path: str | Path) -> Path:
         "scorer_hidden": tm["scorer.1.weight"]["shape"][0],
         "conf_hidden": tm["conf_head.0.weight"]["shape"][0],
         "total_floats": sum(t["numel"] for t in header["tensors"]),
+        "data_offset": data_offset_bytes,  # bytes before the first weight in the .gbw file
+        "weight_depth": max(1, math.ceil(math.log2(sum(t["numel"] for t in header["tensors"])))),
     }
     for k, v in scalars_u32.items():
         out.append(f"def {k}() -> U32:\n  {_u32(v)}\n")
@@ -209,4 +212,28 @@ class RequestBlob:
 
 
 def layout_from_gbw(gbw: str | Path, out: str | Path) -> Path:
-    return write_layout(read_gbw_header(gbw), out)
+    return write_layout(read_gbw_header(gbw), out, data_offset(gbw))
+
+
+def reference_outputs(model, chunks: list[list[int]], questions: list, pad_id: int = 0) -> np.ndarray:
+    """PyTorch float32 forward over a request, in the Bend output order [probs ; conf logits ; logits]."""
+    import torch
+
+    from .model import collate
+    from .serialize import EncodedState
+
+    state = EncodedState(chunks=chunks, tokens=sum(len(c) - 2 for c in chunks))
+    batch = collate([state], questions, pad_id, q_state=[0] * len(questions)).to(model.device)
+    with torch.no_grad():
+        res = model.forward(batch)
+    probs, conf, logits = (res[k].float().cpu().numpy() for k in ("probabilities", "confidence_logit", "logits"))
+    nopt, nq = sum(q.n_options for q in questions), len(questions)
+    out = np.zeros(nopt + nq + nopt, dtype="<f4")
+    o0 = 0
+    for qi, q in enumerate(questions):
+        k = q.n_options
+        out[o0 : o0 + k] = probs[qi, :k]
+        out[nopt + qi] = conf[qi]
+        out[nopt + nq + o0 : nopt + nq + o0 + k] = logits[qi, :k]
+        o0 += k
+    return out

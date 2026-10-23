@@ -52,6 +52,12 @@ def conf_hidden() -> U32:
 def total_floats() -> U32:
   114213
 
+def data_offset() -> U32:
+  6592
+
+def weight_depth() -> U32:
+  17
+
 def eps() -> F32:
   0.0000100000
 

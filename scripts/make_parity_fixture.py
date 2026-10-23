@@ -22,11 +22,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from groot1.bendio import RequestBlob, load_gbw, data_offset
+from groot1.bendio import RequestBlob, data_offset, layout_from_gbw, reference_outputs
 from groot1.config import GrootConfig
 from groot1.export import write_gbw
-from groot1.model import GrootDecisionModel, collate
-from groot1.serialize import EncodedQuestion, EncodedState
+from groot1.model import GrootDecisionModel
+from groot1.serialize import EncodedQuestion
 
 CLS, SEP, MASK, PAD = 2, 1, 4, 0
 
@@ -89,23 +89,11 @@ def main() -> None:
     RequestBlob.write(blob, out / "req.bin")
 
     # ---- torch reference over the identical token structures
-    state = EncodedState(chunks=chunks, tokens=sum(len(c) - 2 for c in chunks))
-    eqs = questions
-    batch = collate([state], eqs, PAD, q_state=[0] * len(eqs))
-    with torch.no_grad():
-        res = model.forward(batch)
+    ref = reference_outputs(model, chunks, questions, PAD)
     nopt = sum(q.n_options for q in questions)
     nq = len(questions)
-    ref = np.zeros(nopt + nq + nopt, dtype="<f4")
-    o0 = 0
-    probs, conf, logits = res["probabilities"].numpy(), res["confidence_logit"].numpy(), res["logits"].numpy()
-    for qi, q in enumerate(questions):
-        k = q.n_options
-        ref[o0 : o0 + k] = probs[qi, :k]
-        ref[nopt + qi] = conf[qi]
-        ref[nopt + nq + o0 : nopt + nq + o0 + k] = logits[qi, :k]
-        o0 += k
     np.save(out / "ref.npy", ref)
+    layout_from_gbw(out / "model.gbw", Path(__file__).resolve().parent.parent / "bend" / "groot" / "layout.bend")
 
     meta = {
         "data_offset": data_offset(out / "model.gbw"),

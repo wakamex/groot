@@ -1,11 +1,14 @@
 # Groot 1 — native command-line engine (CPU threads / GPU via Bend's runtime).
 #
-#   GROOT_WEIGHTS=model.gbw GROOT_WOFF=<data offset> GROOT_WDEPTH=<log2 floats> \
-#   GROOT_REQ=req.bin GROOT_RDEPTH=<log2 words> GROOT_NOUT=<values> ./groot +RTS --threads 8
+#   ./groot model.gbw req.bin --threads 16 --gpu off
 #
+# bend/groot/layout.bend must be generated from the same model.gbw (groot1.bendio.layout_from_gbw);
+# it supplies the weight data offset and size. The request blob's header supplies its own size.
 # Prints the output vector [probs ; confidence logits ; logits], one value per line.
 import Base
 import ./groot/groot.bend as G
+import ./groot/kernels.bend as K
+import ./groot/layout.bend as L
 
 def Blob.load_f32(path: String, offset: U32, depth: U32) -> IO(Array<F32>):
   import "./effs/blob_load_f32.c"
@@ -14,11 +17,6 @@ def Blob.load_f32(path: String, offset: U32, depth: U32) -> IO(Array<F32>):
 def Blob.load_u32(path: String, offset: U32, depth: U32) -> IO(Array<U32>):
   import "./effs/blob_load_u32.c"
   import "./effs/blob_load_u32.js"
-
-def env_u32(name: String) -> IO(U32):
-  do IO<U32>:
-    s : String <- IO.try(String, IO.get_env(name))
-    return Maybe.default(&2, U32, U32.read(s), 0)
 
 def show.go(k: Nat, +i: U32, r: Array<F32> & F32) -> IO(Unit):
   match k:
@@ -35,22 +33,58 @@ def show.go(k: Nat, +i: U32, r: Array<F32> & F32) -> IO(Unit):
 def show(out: Array<F32>, +n: U32) -> IO(Unit):
   show.go(U32.to_nat(U32.sub(n, 1)), 0, Array.get(F32, out, 0))
 
-def run(wpath: String, +woff: U32, +wdepth: U32, bpath: String, +bdepth: U32, +nout: U32) -> IO(Unit):
+# the first n+1 words of an array, as a list
+def head.go(n: Nat, +i: U32, r: Array<U32> & U32) -> List<U32>:
+  match n:
+    case 0n:
+      (a, v) = r
+      [v]
+    case 1n+p:
+      (a, v) = r
+      +j = (i + 1 : U32)
+      Con{v, head.go(p, j, Array.get(U32, a, j))}
+
+# (words in the blob, output values) from a request header (groot1.bendio.RequestBlob):
+# n_chunks, chunk_len_max, n_questions, q_len_max, k_max, n_options
+def sizes.of(+nch: U32, +clen: U32, +nq: U32, +qlen: U32, +kmax: U32, +nopt: U32) -> U32 & U32:
+  ((6 + nch + (4 * nq) + (nch * clen) + (3 * nq * qlen) + (nq * kmax) : U32), (2 * nopt + nq : U32))
+
+def sizes(h: List<U32>) -> U32 & U32:
+  match h:
+    case Con{nch, Con{clen, Con{nq, Con{qlen, Con{kmax, Con{nopt, rest}}}}}}:
+      sizes.of(nch, clen, nq, qlen, kmax, nopt)
+    case _:
+      (0, 0)
+
+def req_sizes(h: Array<U32>) -> U32 & U32:
+  sizes(head.go(5n, 0, Array.get(U32, h, 0)))
+
+def answer(w: Array<F32>, bpath: String, n: U32 & U32) -> IO(Unit):
+  (words, nout) = n
   do IO<Unit>:
-    w : Array<F32> <- Blob.load_f32(wpath, woff, wdepth)
-    b : Array<U32> <- Blob.load_u32(bpath, 0, bdepth)
+    b : Array<U32> <- Blob.load_u32(bpath, 0, U32.from_nat(K.depth_for(words)))
     t0 : Nat <- IO.now()
     out : Array<F32> = G.forward(w, b)
     show(out, nout)
     t1 : Nat <- IO.now()
     IO.print_err("groot forward ms = " ++ Nat.show(Nat.sub(t1, t0)))
 
+def run(wpath: String, +bpath: String) -> IO(Unit):
+  do IO<Unit>:
+    w : Array<F32> <- Blob.load_f32(wpath, L.data_offset(), L.weight_depth())
+    h : Array<U32> <- Blob.load_u32(bpath, 0, 3)
+    answer(w, bpath, req_sizes(h))
+
+def dispatch(args: List<String>) -> IO(Unit):
+  match args:
+    case Con{prog, Con{wpath, Con{bpath, Nil{}}}}:
+      run(wpath, bpath)
+    case _:
+      do IO<Unit>:
+        IO.print_err("usage: groot WEIGHTS.gbw REQUEST.bin [--threads N] [--gpu off|HEAP]")
+        IO.exit(2)
+
 def main() -> IO(Unit):
   do IO<Unit>:
-    wpath : String <- IO.try(String, IO.get_env("GROOT_WEIGHTS"))
-    woff : U32 <- env_u32("GROOT_WOFF")
-    wdepth : U32 <- env_u32("GROOT_WDEPTH")
-    bpath : String <- IO.try(String, IO.get_env("GROOT_REQ"))
-    bdepth : U32 <- env_u32("GROOT_RDEPTH")
-    nout : U32 <- env_u32("GROOT_NOUT")
-    run(wpath, woff, wdepth, bpath, bdepth, nout)
+    args : List<String> <- IO.args()
+    dispatch(args)
