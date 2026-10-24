@@ -112,6 +112,19 @@ The M member of Groot 1 runs without fitted temperatures: its `m/calibration.jso
 
 The refit improves the hard-label choice sets and trades a little typed-decision Brier for lower ECE; true/false questions and ASSIN2 are unchanged within the intervals. It does not change Groot's standing against Jev: on Folha, the Brier difference moves from −0.007 to −0.012, with an interval that still includes zero. The released weights are unchanged; the refit temperatures are the values above.
 
+#### Typed decisions Groot never trained on
+
+The typed-decisions benchmark above uses the four workflows Groot was trained on. Four typed-decision test sets that no training run used show how Groot does on new ones: [n4ze3m/typed-decisions-synth](https://huggingface.co/datasets/n4ze3m/typed-decisions-synth) (149 domains, labels from 3 DeepSeek samples), the test split of [tasksource/synthetic-typed-decisions](https://huggingface.co/datasets/tasksource/synthetic-typed-decisions) scored against its DeepSeek labels only, the GoEmotions, SciCite and Amazon Polarity rows of [m-lagnajit/calibrated-typed-decisions](https://huggingface.co/datasets/m-lagnajit/calibrated-typed-decisions) (human gold), and that dataset's 1,000 expert-labelled PubMedQA questions. No state in them matches typed decisions or the sampled training sources. Up to 1,000 questions per set, the same requests for every system, accuracy with 95% intervals:
+
+| Test set | n | Groot 1 | Jev | Julia 1 | Groot 1 Brier | Jev Brier | Groot 1 ECE | Jev ECE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| n4ze3m typed decisions | 1,000 | 0.594 [0.563, 0.624] | 0.929 [0.912, 0.946] | 0.451 | 0.271 | 0.072 | 0.042 | 0.044 |
+| tasksource synthetic | 1,000 | 0.433 [0.404, 0.463] | 0.762 [0.734, 0.790] | 0.377 | 0.234 | 0.144 | 0.048 | 0.033 |
+| m-lagnajit, human gold | 900 | 0.724 [0.697, 0.753] | 0.811 [0.787, 0.836] | 0.494 | 0.219 | 0.161 | 0.095 | 0.063 |
+| PubMedQA, expert gold | 1,000 | 0.570 [0.540, 0.599] | 0.780 [0.753, 0.804] | 0.335 | 0.577 | 0.335 | 0.114 | 0.119 |
+
+Jev is more accurate than Groot 1 on all four, by 9 to 34 points, and its Brier is lower, with paired intervals that exclude zero. Groot 1 is ahead of Julia 1 on every set. Groot's log loss is lower than Jev's on three sets, because Jev gives probability 0 to an option the gold supports on 1,568 of the 3,900 questions. Its probabilities stay calibrated on new data (ECE 0.04 to 0.11), but on PubMedQA its accuracy is near the 0.552 of always answering "yes". Two of the sets carry a bias: tasksource synthetic dropped questions where Jev and its DeepSeek check confidently disagreed, which favours Jev, and the two DeepSeek-labelled sets measure agreement with another model. The m-lagnajit and PubMedQA rows have human labels and neither bias. The typed-decisions lead above is therefore an in-domain result. [Full results](metrics/zeroshot-20261023.json).
+
 **Long context.** Needle-in-a-haystack decisions. Each request hides one fact in a long state of distractor text and asks one question. There are 100 requests per length. Needle names and templates are disjoint from training.
 
 | State tokens | Groot 1 | Groot 1 S | Jev | Groot 1 p50 | Groot 1 S p50 | Jev p50 |
@@ -181,7 +194,7 @@ Its answers collapsed onto a few section names. v1.0 had learned its classificat
 
 ## Where Groot is accurate — and where it can miss
 
-Groot is strongest when the answer is **a choice grounded in the supplied state**. It leads on typed-decision choice and score questions, on zero-shot Folha news, and on every topic, emotion and intent set we ran. Its Brier and log loss are the best on typed decisions and the topic, emotion and intent sets; on Folha they are level with Jev's. Its typed-decision Brier is under half of Jev's. It handles 151 options in one call, Portuguese as well as English, and states up to 64k tokens.
+Groot is strongest when the answer is **a choice grounded in the supplied state**. It leads on the typed-decisions benchmark it was trained on, on zero-shot Folha news, and on every topic, emotion and intent set we ran; on typed-decision corpora it never saw, Jev is well ahead ([details](#typed-decisions-groot-never-trained-on)). Its Brier and log loss are the best on typed decisions and the topic, emotion and intent sets; on Folha they are level with Jev's. Its typed-decision Brier is under half of Jev's. It handles 151 options in one call, Portuguese as well as English, and states up to 64k tokens.
 
 Read the classification rows with care. **Groot was trained on the train splits of every classification set in the table**, so those are in-domain supervised results. Jev and Julia 1 do not publish their training data, so the comparison is not zero-shot for Groot. Folha news is the zero-shot check.
 
@@ -339,6 +352,9 @@ groot-data build --out data/v1                         # public sources, see gro
 python scripts/benchmark.py build --test data/v1/test.jsonl --per-source 500 --out bench.jsonl \
     --sources typed_decisions agnews emotion banking77 clinc150 massive_en massive_pt assin2 hatebr boolq
 python scripts/folha.py --out data/folha.jsonl && cat data/folha.jsonl >> bench.jsonl   # 400 Folha articles
+groot-data build --sources typed_synth,synth_deepseek,calibrated_td --out data/zeroshot  # typed decisions Groot never saw
+python scripts/benchmark.py build --test data/zeroshot/test.jsonl --per-source 1000 --out zeroshot.jsonl \
+    --sources typed_synth synth_deepseek calibrated_td pubmedqa_heldout
 python scripts/benchmark.py run --rows bench.jsonl --groot Groot-1 \
     --julia path/to/Julia-1 --jev --out results.json   # Jev needs TYPESAFE_API_KEY
 python scripts/benchmark.py table --results results.json
@@ -369,6 +385,7 @@ The trainer batches by token budget, resumes from periodic checkpoints and rolls
 - Groot 1 is **1.9 GB** and runs two models per request. Groot 1 S is **569 MiB** at half the latency. CPU inference works. A GPU is needed for long states at interactive latency.
 - Classification results are **in-domain**: Groot saw the train splits of those datasets.
 - Folha news is zero-shot, but it is one newspaper and 8 sections. Expect lower accuracy on unusual label sets and domains.
+- On typed-decision workflows outside its training data, Groot 1 is 9 to 34 points less accurate than Jev. Evaluate on your own workflows before relying on it.
 - Groot is weak on questions that need world knowledge or multi-step reasoning, as BoolQ shows.
 - Surface cues can outweigh meaning. "I was charged twice for the same order" routes to shipping, because the word "order" dominates. Groot 1 S gives it 0.97 probability and Groot 1 gives it 0.56. Keep option descriptions distinct and test your own phrasing.
 - States above 16k tokens are slower than Jev's API, and accuracy degrades with long distractor-heavy states.
