@@ -164,12 +164,13 @@ def conv_open_jev(limit: int | None = None) -> Iterator[Row]:
                 continue
 
 
-def _questions_rows(source: str, hf_id: str, config: str | None, splits, limit: int | None = None, lang: str = "en") -> Iterator[Row]:
+def _questions_rows(source: str, hf_id: str, config: str | None, splits, limit: int | None = None, lang: str = "en",
+                    gold_key: str | None = None, id_key: str = "id") -> Iterator[Row]:
     """Rows of the form {state: json, questions: json{name: {type, instructions, criteria}}, gold|answers: json{name: {...}}}.
 
-    Used by LocalLLaMA/typed-decisions (`gold`) and tasksource/procedural-typed-decisions (`answers`).
-    Choice probabilities are keyed by option name, score probabilities by level index or level text,
-    noul carries `noul` or probabilities {false, true}.
+    Used by LocalLLaMA/typed-decisions (`gold`) and tasksource/procedural-typed-decisions (`answers`); gold_key names
+    another column with the same shape. Choice probabilities are keyed by option name, score probabilities by level
+    index or level text, noul carries `noul` or probabilities {false, true}.
     """
     for hf_split, split in splits:
         try:
@@ -184,49 +185,54 @@ def _questions_rows(source: str, hf_id: str, config: str | None, splits, limit: 
                 state = json.loads(state) if isinstance(state, str) else state
                 questions = r.get("questions")
                 questions = json.loads(questions) if isinstance(questions, str) else questions
-                gold = r.get("gold", r.get("answers"))
+                gold = r.get(gold_key) if gold_key else r.get("gold", r.get("answers"))
                 gold = json.loads(gold) if isinstance(gold, str) else gold
             except (json.JSONDecodeError, TypeError):
                 continue
-            if not isinstance(questions, dict) or not isinstance(gold, dict):
+            yield from _question_rows(source, r.get(id_key, i), state, questions, gold, split, lang)
+
+
+def _question_rows(source: str, rid, state, questions, gold, split: str, lang: str) -> Iterator[Row]:
+    """One decision row per typed question of a case, with the target from gold[name]."""
+    if not isinstance(questions, dict) or not isinstance(gold, dict):
+        return
+    for name, q in questions.items():
+        g = gold.get(name)
+        if not isinstance(q, dict) or not isinstance(g, dict):
+            continue
+        qtype = q.get("type") or g.get("type")
+        instr = render_content(q.get("instructions"))
+        probs = g.get("probabilities") or {}
+        try:
+            if qtype == "choice":
+                crit = q.get("criteria") or {}
+                names = list(crit) if isinstance(crit, dict) else [str(c) for c in crit]
+                options = choice_options(names, crit if isinstance(crit, dict) else None)
+                target = [float(probs.get(n, 0.0)) for n in names]
+                if sum(target) <= 0 and g.get("choice") in names:
+                    target = one_hot(names.index(g["choice"]), len(names))
+                if sum(target) <= 0 and g.get("label") in names:
+                    target = one_hot(names.index(g["label"]), len(names))
+            elif qtype == "score":
+                crit = q.get("criteria") or []
+                levels = [render_content(c) for c in crit]
+                options = score_options(levels)
+                target = [float(probs.get(str(k), probs.get(levels[k], 0.0))) for k in range(len(levels))]
+            elif qtype == "noul":
+                p = g.get("noul")
+                if p is None:
+                    p = probs.get("true")
+                if p is None:
+                    continue
+                crit = q.get("criteria") if isinstance(q.get("criteria"), dict) else {}
+                f, t = render_content(crit.get("false")), render_content(crit.get("true"))
+                options = [f"false: {f}" if f else "false", f"true: {t}" if t else "true"]
+                target = [1.0 - float(p), float(p)]
+            else:
                 continue
-            for name, q in questions.items():
-                g = gold.get(name)
-                if not isinstance(q, dict) or not isinstance(g, dict):
-                    continue
-                qtype = q.get("type") or g.get("type")
-                instr = render_content(q.get("instructions"))
-                probs = g.get("probabilities") or {}
-                try:
-                    if qtype == "choice":
-                        crit = q.get("criteria") or {}
-                        names = list(crit) if isinstance(crit, dict) else [str(c) for c in crit]
-                        options = choice_options(names, crit if isinstance(crit, dict) else None)
-                        target = [float(probs.get(n, 0.0)) for n in names]
-                        if sum(target) <= 0 and g.get("choice") in names:
-                            target = one_hot(names.index(g["choice"]), len(names))
-                        if sum(target) <= 0 and g.get("label") in names:
-                            target = one_hot(names.index(g["label"]), len(names))
-                    elif qtype == "score":
-                        crit = q.get("criteria") or []
-                        levels = [render_content(c) for c in crit]
-                        options = score_options(levels)
-                        target = [float(probs.get(str(k), probs.get(levels[k], 0.0))) for k in range(len(levels))]
-                    elif qtype == "noul":
-                        p = g.get("noul")
-                        if p is None:
-                            p = probs.get("true")
-                        if p is None:
-                            continue
-                        crit = q.get("criteria") if isinstance(q.get("criteria"), dict) else {}
-                        f, t = render_content(crit.get("false")), render_content(crit.get("true"))
-                        options = [f"false: {f}" if f else "false", f"true: {t}" if t else "true"]
-                        target = [1.0 - float(p), float(p)]
-                    else:
-                        continue
-                    yield make_row(source, f"{r.get('id', i)}/{name}", state, instr, qtype, options, target, split, lang)
-                except (ValueError, TypeError, IndexError):
-                    continue
+            yield make_row(source, f"{rid}/{name}", state, instr, qtype, options, target, split, lang)
+        except (ValueError, TypeError, IndexError):
+            continue
 
 
 def conv_typed_decisions(limit: int | None = None) -> Iterator[Row]:
@@ -540,9 +546,88 @@ def conv_jev_distill(limit=None):
     return _generic_rows("jev_distill", "SargeDev/jev-distill-corpus-v3", "yuri_v3", limit)
 
 
+# --------------------------------------- held-out typed decisions (not in training)
+# Typed-decision corpora Groot never trained on, for calibration and zero-shot evaluation. None of them is in the
+# default `groot-data build` sources.
+
+def _json_or_text(v):
+    if isinstance(v, str) and v[:1] in "{[":
+        try:
+            return json.loads(v)
+        except json.JSONDecodeError:
+            return v
+    return v
+
+
+def conv_typed_synth(limit: int | None = None) -> Iterator[Row]:
+    """n4ze3m/typed-decisions-synth (MIT): DeepSeek-written cases, soft labels the mean of 3 DeepSeek samples.
+
+    Its train split is unseen by Groot, so it is mapped to `test` (zero-shot evaluation); validation stays `val`."""
+    for hf_split, split in (("train", "test"), ("validation", "val")):
+        for i, r in enumerate(_load("n4ze3m/typed-decisions-synth", None, split=hf_split, streaming=True)):
+            if limit and i >= limit:
+                break
+            yield from _question_rows("typed_synth", r["state_id"], _json_or_text(r["state"]), json.loads(r["questions"]),
+                                      json.loads(r["teacher"]), split, "en")
+
+
+def conv_synth_deepseek(limit: int | None = None) -> Iterator[Row]:
+    """tasksource/synthetic-typed-decisions (Apache-2.0), test split only, with its DeepSeek check as the label.
+
+    The dataset's own `answers` average Jev 1.13 with that check, so they are not used; Jev also influenced which
+    questions were kept (confident disagreements were dropped), so read results on it with that in mind."""
+    for i, r in enumerate(_load("tasksource/synthetic-typed-decisions", None, split="test", streaming=True)):
+        if limit and i >= limit:
+            break
+        questions, teachers = json.loads(r["questions"]), json.loads(r["teachers"])
+        gold = {}
+        for name, q in questions.items():
+            p = (teachers.get(name) or {}).get("deepseek-v4-flash")
+            if not p:
+                continue
+            if q.get("type") == "noul":
+                gold[name] = {"noul": float(p[0])}
+            elif q.get("type") == "choice":
+                gold[name] = {"probabilities": dict(zip(list(q.get("criteria") or {}), p))}
+            elif q.get("type") == "score":
+                gold[name] = {"probabilities": {str(k): v for k, v in enumerate(p)}}
+        yield from _question_rows("synth_deepseek", r["id"], _json_or_text(r["state"]), questions, gold, "test", "en")
+
+
+CALIBRATED_TD_SOURCES = ("google-research-datasets/go_emotions", "allenai/scicite", "mteb/amazon_polarity")
+
+
+def conv_calibrated_td(limit: int | None = None) -> Iterator[Row]:
+    """m-lagnajit/calibrated-typed-decisions (CC-BY-4.0): validation and test rows from sources Groot never trained on
+    (CALIBRATED_TD_SOURCES; its CLINC, Banking77 and MASSIVE rows are skipped), targets its recommended soft_label;
+    plus the 1,000 expert-labelled PubMedQA `heldout` questions as `pubmedqa_heldout` test rows with one-hot targets,
+    which its card says not to train or fit on."""
+    for hf_split, split in (("validation", "val"), ("test", "test"), ("heldout", "test")):
+        for i, r in enumerate(_load("m-lagnajit/calibrated-typed-decisions", None, split=hf_split, streaming=True)):
+            if limit and i >= limit:
+                break
+            held = hf_split == "heldout"
+            if not held and r["source"] not in CALIBRATED_TD_SOURCES:
+                continue
+            names = list(r["options"])
+            if r["type"] == "noul":
+                options = ["false", "true"]
+            else:
+                options = choice_options(names, dict(zip(names, r.get("option_descriptions") or [])))
+            target = one_hot(int(r["gold_index"]), len(names)) if held or not r.get("soft_label") else list(r["soft_label"])
+            try:
+                yield make_row("pubmedqa_heldout" if held else "calibrated_td", r["id"], r["state"], r["instructions"], r["type"],
+                               options, target, split, "en")
+            except ValueError:
+                continue
+
+
 CONVERTERS.update({
     "tasksource": conv_tasksource,
     "procedural": conv_procedural,
+    "typed_synth": conv_typed_synth,
+    "synth_deepseek": conv_synth_deepseek,
+    "calibrated_td": conv_calibrated_td,
     "jev_distill": conv_jev_distill,
 })
 
