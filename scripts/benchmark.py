@@ -98,6 +98,7 @@ def probs_of(answer: dict, kind: str, keys: list[str]) -> list[float]:
     return [x / s for x in v]
 
 
+SYSTEMS = ("groot", "julia", "jev", "nimble")
 LOG_FLOOR = 1e-6
 COVERAGES = (0.5, 0.8)
 ECE_BINS = 10
@@ -278,6 +279,45 @@ def run_jev(rows, workers=8):
         return list(ex.map(one, rows))
 
 
+def nimble_field(q: dict) -> dict:
+    """A System One question as a Nimble schema field, as nimble/serving/compiler.py maps them."""
+    field = {"description": q.get("instructions") or ""}
+    if q["type"] == "noul":
+        crit = q.get("criteria") or {}
+        field.update(type="boolean", choices=[False, True], choice_descriptions={k: crit.get(k) or k for k in ("false", "true")})
+    elif q["type"] == "choice":
+        field.update(type="enum", choices=list(q["criteria"]), choice_descriptions={k: v or k for k, v in q["criteria"].items()})
+    else:
+        field.update(type="enum", choices=[str(i) for i in range(len(q["criteria"]))],
+                     choice_descriptions={str(i): t for i, t in enumerate(q["criteria"])})
+    return field
+
+
+def run_nimble(rows, model_path: str, repo: str, max_input_tokens: int = 4096):
+    """Bespoke Nimble through its own CUDA candidate scorer (bespokelabsai/nimble checkout at `repo`), release
+    temperature, one full-prompt prefill per question."""
+    import sys
+
+    sys.path.insert(0, repo)
+    from nimble.scoring.cuda_scorer import CudaCandidateScorer
+
+    scorer = CudaCandidateScorer(model_path, Path(model_path).name, None, max_input_tokens=max_input_tokens)
+    out = []
+    for r in rows:
+        q, keys = to_question(r)
+        state = r["state"] if isinstance(r["state"], str) else json.dumps(r["state"], ensure_ascii=False)
+        try:
+            t0 = time.perf_counter()
+            res = scorer.score(state, {"q": nimble_field(q)})
+            dt = (time.perf_counter() - t0) * 1000
+            scores = res["fields"]["q"]["scores"]
+            p = [float(scores[k]) for k in keys]
+            out.append({"p": [x / (sum(p) or 1.0) for x in p], "ms": dt})
+        except Exception as e:
+            out.append({"skip": f"error: {str(e)[:120]}"})
+    return out
+
+
 def summarize(rows, res):
     out = {}
     for k, idx in groups(rows).items():
@@ -317,7 +357,7 @@ def compare(rows, out: str, results: dict) -> None:
         return
     g = load_per_row(per_row_path(out, "groot"), rows)
     results["paired"] = {name: paired(rows, g, load_per_row(per_row_path(out, name), rows))
-                         for name in ("julia", "jev") if per_row_path(out, name).exists()}
+                         for name in SYSTEMS[1:] if per_row_path(out, name).exists()}
 
 
 def per_row_path(out: str, name: str) -> Path:
@@ -339,7 +379,7 @@ def load_per_row(path: Path, rows) -> list[dict]:
 
 
 def table(results: dict) -> str:
-    systems = [s for s in ("groot", "julia", "jev") if s in results]
+    systems = [s for s in SYSTEMS if s in results]
     keys = sorted({k for s in systems for k in results[s]}, key=lambda k: (" / " in k, k))
     lines = ["| Benchmark | n | " + " | ".join(f"{s.capitalize()} acc | {s.capitalize()} Brier" for s in systems) + " |",
              "|" + "---|" * (2 + 2 * len(systems))]
@@ -355,7 +395,7 @@ def table(results: dict) -> str:
 
 def calibration_table(results: dict) -> str:
     """Log loss and selective accuracy at 80% coverage per system, plus Groot ranked by p_correct."""
-    systems = [s for s in ("groot", "julia", "jev") if s in results]
+    systems = [s for s in SYSTEMS if s in results]
     keys = sorted({k for s in systems for k in results[s]}, key=lambda k: (" / " in k, k))
     head = [f"{s.capitalize()} log loss | {s.capitalize()} acc@80%" for s in systems]
     if "groot" in systems:
@@ -376,7 +416,7 @@ def calibration_table(results: dict) -> str:
 
 def detail_table(results: dict) -> str:
     """ECE, KL and (score questions) RPS per system."""
-    systems = [s for s in ("groot", "julia", "jev") if s in results]
+    systems = [s for s in SYSTEMS if s in results]
     keys = sorted({k for s in systems for k in results[s]}, key=lambda k: (" / " in k, k))
     lines = ["| Benchmark | n | " + " | ".join(f"{s.capitalize()} ECE | {s.capitalize()} KL | {s.capitalize()} RPS" for s in systems) + " |",
              "|" + "---|" * (2 + 3 * len(systems))]
@@ -422,6 +462,8 @@ def main() -> None:
     r.add_argument("--groot-set", action="append", default=[])
     r.add_argument("--julia", default=None)
     r.add_argument("--jev", action="store_true")
+    r.add_argument("--nimble", default=None, help="merged Nimble checkpoint directory")
+    r.add_argument("--nimble-repo", default=None, help="bespokelabsai/nimble checkout providing its scorer")
     r.add_argument("--out", required=True)
     t = sub.add_parser("table")
     t.add_argument("--results", required=True)
@@ -438,7 +480,7 @@ def main() -> None:
     rows = [json.loads(l) for l in open(args.rows, encoding="utf-8")]
     results = json.loads(Path(args.out).read_text()) if Path(args.out).exists() else {}
     if args.cmd == "rescore":
-        for name in ("groot", "julia", "jev"):
+        for name in SYSTEMS:
             if per_row_path(args.out, name).exists():
                 results[name] = summarize(rows, load_per_row(per_row_path(args.out, name), rows))
         compare(rows, args.out, results)
@@ -447,7 +489,8 @@ def main() -> None:
         return
     for name, fn in (("groot", lambda: run_groot(rows, args.groot, args.groot_set) if args.groot else None),
                      ("julia", lambda: run_julia(rows, args.julia) if args.julia else None),
-                     ("jev", lambda: run_jev(rows) if args.jev else None)):
+                     ("jev", lambda: run_jev(rows) if args.jev else None),
+                     ("nimble", lambda: run_nimble(rows, args.nimble, args.nimble_repo) if args.nimble else None)):
         res = fn()
         if res is None:
             continue
